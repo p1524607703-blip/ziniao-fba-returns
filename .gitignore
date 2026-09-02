@@ -1,0 +1,13 @@
+# === 数据文件：含真实订单数据，绝不入库 ===
+*.csv
+*.bak
+daily_state.json
+
+# === 配置：含店铺标识，绝不入库 ===
+config.json
+
+# === 运行环境 ===
+node_modules/
+.DS_Store
+*.tmp
+*.log

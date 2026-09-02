@@ -1,0 +1,7 @@
+{
+  "_comment": "复制此文件为 config.json 并填入真实值；config.json 已被 .gitignore 排除，不会进入版本库。也可用环境变量代替：FBA_STORE_ID / FBA_STORE_NAME / FBA_CLI_PATH / FBA_MARKETPLACE_URL。",
+  "storeId": "YOUR_STORE_ID",
+  "storeName": "紫鸟浏览器中的店铺显示名",
+  "cliPath": "/opt/homebrew/bin/ziniao-cli",
+  "marketplaceUrl": "https://sellercentral.amazon.com/fba-return"
+}
