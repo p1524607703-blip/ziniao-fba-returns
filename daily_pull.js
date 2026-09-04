@@ -14,9 +14,12 @@ const DIR = __dirname;
 const MASTER = path.join(DIR, 'master.csv');
 const GOOD_BAK = path.join(DIR, 'master.csv.good.bak'); // last-known-good 自愈快照
 const HEADER = ['Marketplace', 'Order ID', 'Image', 'Title', 'ASIN', 'Seller SKU', 'Return Reason', 'Authorization Date', 'Refund Date', 'Unit Received Date', 'Disposition', 'Status', 'Action'];
-const FILTER = 'LAST_7_DAYS'; // 7天窗口:单次运行仅~10页,远在"21页卡断"阈值之下,游标日常仅~1天新,安全且命中即停。回溯补登/游标消失由独立的"每周深扫"任务覆盖(见对话)
+const FILTER = 'LAST_7_DAYS'; // 7天退款日窗口: 游标方案已改为"全量翻页扫描整窗 + 按订单×ASIN 去重",不再命中游标即停。
+// 原因: FBA 退货列表按授权/订单时间排序, 退款日刚进 7 天窗口但排序键更老的记录会排在游标下方被漏抓;
+// 全扫整窗(筛选本就按退款日)可闭合该缺口。7 天窗口单次约 2-3 页, 远低于 UI ~1万行上限;
+// 退款日 >7 天的迟到记录由独立"每周深扫(30天)"兜底(见对话与 automation memory)。
 const PAGE_SIZE = 1000;
-const MAX_PAGES = 50; // 仅作失控保护;正常情况下命中游标会提前停(日常游标仅~1天新,停在第1-2页)
+const MAX_PAGES = 50; // 仅作失控保护: 全扫整窗正常情况下 2-3 页即无下一页而停
 const STATE = path.join(DIR, 'daily_state.json');
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
@@ -231,7 +234,8 @@ function writeState(s) { fs.writeFileSync(STATE, JSON.stringify(s, null, 2), 'ut
   if (!inj || inj.status !== 'OK') { console.error('注入失败'); process.exit(1); }
   await sleep(rand(9000, 11000));
 
-  // 3) paginate + collect (游标增量:从顶部往下翻,命中上次最新 Order ID 即停)
+  // 3) paginate + collect (全量翻页扫描 7 天整窗: 不再命中游标即停, 翻到无下一页为止;
+  //    游标仅作日志标记; 旧行由去重挡掉, 故整窗重扫零重复)
   const masterRead = readMaster();
   if (masterRead.corrupt) {
     console.error('[保安] 中止: 现有 master.csv 损坏 ->', masterRead.reason);
@@ -269,8 +273,7 @@ function writeState(s) { fs.writeFileSync(STATE, JSON.stringify(s, null, 2), 'ut
     }
     collected.push(...fullRows);
     pages++;
-    console.log(`   第 ${pages} 页: +${fullRows.length} 行 (累计 ${collected.length})${hitCursor ? ' [命中游标]' : ''}`);
-    if (hitCursor) { console.log('   -> 已抵达上次边界, 停止翻页'); break; }
+    console.log(`   第 ${pages} 页: +${fullRows.length} 行 (累计 ${collected.length})${hitCursor ? ' [经过上次游标]' : ''}`);
     if (pages >= MAX_PAGES) break;
     // click next
     const nx = await pageExec(tid, path.join(DIR, 'next.js'));
