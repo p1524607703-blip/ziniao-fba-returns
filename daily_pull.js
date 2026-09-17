@@ -5,6 +5,7 @@ const path = require('path');
 
 // 店铺与 CLI 全部来自配置（config.json 或环境变量），脚本本身不含任何店铺信息
 const { requireConfig } = require('./config');
+const { ensureStore } = require('./store_guard');
 const cfg = requireConfig();
 const CLI = cfg.cliPath;
 const STORE_ID = cfg.storeId;
@@ -208,12 +209,16 @@ function writeState(s) { fs.writeFileSync(STATE, JSON.stringify(s, null, 2), 'ut
   const today = new Date(Date.now() + 8 * 3600 * 1000).toISOString().slice(0, 10);
   console.log(`[${today}] ${STORE_NAME} FBA 每日新增退货提取 启动`);
 
-  await runCli(['store', 'open', '--name', STORE_NAME, '--url', URL_], 60000);
-  const v = await runCli(['zclaw', 'invoke', 'visit_page', '--args', JSON.stringify({ storeId: STORE_ID, url: URL_ })], 60000);
-  let tid = null;
-  try { const o = JSON.parse(v.out); tid = o?.data?.data?.targetId || o?.data?.targetId; } catch (e) {}
-  if (!tid) { console.error('no targetId:', v.out.slice(0, 200)); process.exit(1); }
-  console.log('   targetId =', tid);
+  // 0) 前置判定：店铺必须可控且在 FBA 退货页（store_guard.js，来源无关 + 失败自动补救）
+  //    FBA_FORCE_FRESH=1  → 直接关店冷启动
+  //    FBA_NO_REMEDIATE=1 → 禁用自动补救（仅验证）
+  const g = await ensureStore(cfg, {
+    fresh: process.env.FBA_FORCE_FRESH === '1',
+    remediate: process.env.FBA_NO_REMEDIATE !== '1',
+  });
+  g.warnings.forEach(w => console.warn('   [guard][warn] ' + w));
+  if (!g.ok) { console.error('[guard] 中止: ' + g.reason); process.exit(11); }
+  const tid = g.tid;
   await sleep(6000);
 
   // 1) apply LAST_7_DAYS filter

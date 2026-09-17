@@ -37,6 +37,19 @@ metadata:
 
 失败是**设计行为**，不是故障：去重键保证幂等，次日续跑不会漏数据（整窗重扫，重复行自动被挡掉）。
 
+### 店铺可控性守卫（自动执行，无需手动）
+
+抓取前 `daily_pull.js` / `pull_latest_raw.js` 会调用 `store_guard.js` 过闸：
+
+1. 硬门禁：`visit_page` 必须返回非空 `targetId`；
+2. 页面实测：注入 JS 检查 URL 含 `fba-return`、退货表或 `LAST_7_DAYS` 筛选器存在；
+3. 自动补救：不过 → `store close` + 冷启动重开 + 重新验证（仅一次）；
+4. fail-closed：仍不过 → 中止（退出码 `11`），绝不空跑。
+
+> [!warning] 不要用"谁打开的窗口"来判断
+> 实测 `store open` 返回的 `launchSource` 在「CLI 新建」与「复用已有窗口」两种情况下**都报 `cli`**，`extract_data mode=store` 只给 `running`，桥日志为空 → 无法区分手动打开，据此放行属**假安全**。故采用**来源无关**的页面实测。
+> 可用 `FBA_FORCE_FRESH=1` 强制冷启动、`FBA_NO_REMEDIATE=1` 关闭自动补救。
+
 ---
 
 ## 快速开始
@@ -188,6 +201,8 @@ Disposition / Status / Action
 | 脚本 | 用途 |
 |---|---|
 | `daily_pull.js` | **每日增量主脚本**，定时任务入口 |
+| `store_guard.js` | **店铺可控性守卫**（被 daily_pull / pull_latest_raw 调用）：硬门禁 + 页面实测 + 失败自动补救；来源无关判定 |
+| `pull_latest_raw.js` | 一次性抓「最近 N 条」**原始快照（不去重）**，`RAW_TARGET` 可调（默认 4000），不读写 master.csv / daily_state.json |
 | `deep_scan.js` | 30 天深扫，用于补登与回溯；每 15 页重置一次以规避卡死 |
 | `validate_extract.js` | 只验证提取逻辑是否正确，不写文件 |
 | `verify_csv.js` | 对已有 CSV 做严格 13 列校验 |
