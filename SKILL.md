@@ -254,6 +254,31 @@ Disposition / Status / Action
 
 ---
 
+## 上传日报到钉钉知识库（两步，缺一不可）
+
+日报产出后若需归档到钉钉知识库，**必须分两步**，否则文件会落在知识库根目录而不是业务子目录：
+
+| 步骤 | 命令 |
+|---|---|
+| ① 上传 | `cd fba-returns && dws drive +upload --file "<日报文件名>" --workspace pyjzZj7x7W7q0zwx --yes` |
+| ② 归位 | `dws wiki +move --node <上一步返回的 nodeId> --folder Qnp9zOoBVBZZLl5xhek1EyEqV1DK0g6l --workspace pyjzZj7x7W7q0zwx --yes` |
+
+**目标位置**：知识库「Ai 问答知识库」（`pyjzZj7x7W7q0zwx`）→ 子目录「FBA退货报告数据」（`Qnp9zOoBVBZZLl5xhek1EyEqV1DK0g6l`）。
+
+> ⚠️ **为什么必须两步**：目标子目录属**知识库（Workspace）类型**，用 `--folder` 走钉盘上传会被拒
+> （`paramError: 目标空间是知识库（Workspace）类型，不支持通过钉盘上传`）。
+> 而 `--workspace` 只能指定知识库、**默认落在根目录 `#ROOT#`**。
+> 因此正确姿势是「先 `--workspace` 上传，再 `wiki +move --folder` 归位」。
+
+踩坑记录与注意点：
+
+- `dws` 写操作默认 `confirmation=user_required`。**不加 `--yes` 会挂起等待交互，表现为无输出 + 进程被 SIGTERM（exit 137）**，极易误判为超时/网络失败。确认目标无误后可加 `--yes`。
+- 上传后用 `dws wiki +node-get --node <nodeId>` 核对 `parentFolderId` 是否等于目标子目录 ID —— 这是验证「有没有落对位置」的唯一可靠方式（只看上传成功的 `success:true` 会被骗）。
+- 归档前先查重：`dws wiki +node-search --query "导出增量数据" --workspace pyjzZj7x7W7q0zwx`。
+- 上传的是**已脱敏的日报分片**（`Title` 列内容为空），见上节「外发件脱敏」。
+
+---
+
 ## 定时运行
 
 若用 WorkBuddy 自动化实现每日运行，注意：**rrule 的 BYHOUR 按本机本地时间解释，
