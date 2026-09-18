@@ -22,6 +22,11 @@ const FILTER = 'LAST_7_DAYS'; // 7天退款日窗口: 游标方案已改为"全�
 const PAGE_SIZE = 1000;
 const MAX_PAGES = 50; // 仅作失控保护: 全扫整窗正常情况下 2-3 页即无下一页而停
 const STATE = path.join(DIR, 'daily_state.json');
+// 导出日报的 Title 列: 保留列头、清空内容(用户 2026-09-17 定, 因日报要上传钉钉知识库)。
+// master.csv 是本地台账, 仍保留 Title 原文, 只有外发的日报分片做脱敏。
+// 需要临时还原全文时: FBA_KEEP_TITLE=1 node daily_pull.js
+const REDACT_TITLE = process.env.FBA_KEEP_TITLE !== '1';
+const TITLE_IDX = HEADER.indexOf('Title');
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 const rand = (a, b) => Math.floor(a + Math.random() * (b - a));
@@ -288,6 +293,8 @@ function writeState(s) { fs.writeFileSync(STATE, JSON.stringify(s, null, 2), 'ut
   try { fs.unlinkSync(injFile); } catch (e) {}
 
   // 4) dedupe vs master (按 订单号+ASIN 去重,一条退货事件只记一次)
+  //    日报分片(上传知识库的外发件)会清空 Title 列内容、保留列头; master 台账保留全文。
+  console.log(`4) 去重落盘 (Title 列: master 保留原文 / 日报分片${REDACT_TITLE ? '清空内容' : '保留原文'})`);
   const newLines = [];
   const newRowCells = [];                     // 与 newLines 平行, 保留单元格用于日报命名统计
   for (const row of collected) {
@@ -299,7 +306,15 @@ function writeState(s) { fs.writeFileSync(STATE, JSON.stringify(s, null, 2), 'ut
     }
     const line = r13.map(esc).join(',');
     const k = rowKeyOf(r13);
-    if (!existing.has(k)) { existing.add(k); newLines.push(line); newRowCells.push(r13.slice()); masterLines.push(line); }
+    if (!existing.has(k)) {
+      existing.add(k);
+      // master 台账入库时保留 Title 原文; 日报分片(外发件)按 REDACT_TITLE 清空 Title 内容, 列头不变
+      const reportCells = r13.slice();
+      if (REDACT_TITLE && TITLE_IDX >= 0) reportCells[TITLE_IDX] = '';
+      newLines.push(reportCells.map(esc).join(','));
+      newRowCells.push(r13.slice());          // 命名统计仍用原始行(取 Refund Date, 不受 Title 脱敏影响)
+      masterLines.push(line);
+    }
   }
   const content = masterLines.join('\n');
   // 保安检 4: 落盘前最后确认内容不是二进制(xlsx 签名 PK)
@@ -339,6 +354,7 @@ function writeState(s) { fs.writeFileSync(STATE, JSON.stringify(s, null, 2), 'ut
     date: today, filter: FILTER, pagesPulled: pages, rowsCollected: collected.length,
     newRows: newLines.length, masterTotal: masterLines.length - 1, stuck, hitCursor,
     cursorPrev: cursor, cursorNew: newCursor, elapsedSec: dt,
+    titleRedactedInDailyReport: REDACT_TITLE,
     dailyReport: newLines.length > 0 ? dailyReport : '(无新增, 未生成)'
   }, null, 2));
 })().catch(e => { console.error('FATAL', e); process.exit(1); });
