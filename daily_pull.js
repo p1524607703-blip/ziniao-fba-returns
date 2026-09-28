@@ -21,6 +21,19 @@ const FILTER = 'LAST_7_DAYS'; // 7天退款日窗口: 游标方案已改为"全�
 // 退款日 >7 天的迟到记录由独立"每周深扫(30天)"兜底(见对话与 automation memory)。
 const PAGE_SIZE = 1000;
 const MAX_PAGES = 50; // 仅作失控保护: 全扫整窗正常情况下 2-3 页即无下一页而停
+// ---- 页面延迟容忍 (2026-09-23 修复) ----------------------------------------
+// 故障现象: 拉取页数=1 / 只抓到 25 条 / stuck=true。
+// 根因: Amazon FBA Return 表格是服务端渲染, 改「每页条数」和点「下一页」之后,
+//       数据要 20~60s 才真正落下来。旧版用固定 sleep(9~11s / 8~10s) 硬等,
+//       结果 ①表格仍是默认 25 行就开抓 -> 只拿到 25 条;
+//            ②点 next 后首行没变就判「翻页卡死」-> 直接中断整个 7 天窗扫描。
+//       故障是间歇性的(09-15 / 09-17 / 09-23 均命中), 会被误读成「低量日」。
+// 修法: 不再猜时间, 轮询到「页面实测状态真的变了」才继续。任何一次未达标都重试/降级,
+//       绝不因为"没等够"而假设已达万行上限。7 天窗真实量约 9 千条(363 页 x 25)。
+const SETTLE_RPP_TIMEOUT_MS = 150000;   // 「每页条数」生效上限 150s
+const SETTLE_PAGE_TIMEOUT_MS = 120000;  // 「翻页」生效上限 120s
+const POLL_INTERVAL_MS = 4000;          // 轮询间隔
+
 const STATE = path.join(DIR, 'daily_state.json');
 // 导出日报的 Title 列: 保留列头、清空内容(用户 2026-09-17 定, 因日报要上传钉钉知识库)。
 // master.csv 是本地台账, 仍保留 Title 原文, 只有外发的日报分片做脱敏。
@@ -101,26 +114,86 @@ function parseExecResult(s) {
   } catch (e) {}
   return null;
 }
-async function pageExec(tid, scriptFile, timeout = 55000) {
+// 2026-09-23: 增加瞬态重试。ZClaw Bridge 会「端口在听但假死」, 表现为
+// CDP_ERROR / 无法连接 Bridge; 这类错误单发重试即可恢复, 不应直接判失败。
+async function pageExecOnce(tid, scriptFile, timeout) {
   const script = fs.readFileSync(scriptFile, 'utf8');
   const r = await runCli(['page', 'exec', '--store-id', STORE_ID, '--target-id', tid, '--script', script, '--timeout', '50000'], timeout);
-  if (r.code !== 0) { console.error('page exec failed:', r.err.slice(0, 300)); return null; }
-  return parseExecResult(r.out);
+  if (r.code !== 0) return { transient: true, err: r.err.slice(0, 300) };
+  const res = parseExecResult(r.out);
+  if (!res) return { transient: true, err: 'no parseable result' };
+  return { transient: false, res };
+}
+async function pageExec(tid, scriptFile, timeout = 55000) {
+  const TRANSIENT_RETRY = 3;
+  for (let i = 1; i <= TRANSIENT_RETRY; i++) {
+    const r = await pageExecOnce(tid, scriptFile, timeout);
+    if (!r.transient) return r.res;
+    const isTransient = /CDP_ERROR|无法连接紫鸟浏览器|network|timeout|ECONNREFUSED/i.test(r.err || '');
+    console.error('page exec failed' + (isTransient ? ' [transient]' : '') + ':', (r.err || '').slice(0, 200));
+    if (!isTransient || i === TRANSIENT_RETRY) return null;
+    // 桥假死时给足恢复时间, 退避重试
+    await sleep(6000 * i);
+  }
+  return null;
 }
 function makeInjectScript(val) {
+  // 2026-09-23 修复: 必须走「原型 setter + input/change」双事件。
+  // 直接 sel.value=... 只是改了 DOM 属性, 页面(AJS/jQuery 受控组件)检测不到,
+  // 表格不会重新取数 —— 旧版因此误报 OK 却停在 25 行/页。
+  // 且 1000 不是页面自带选项, 需要先补一个真 option。
   return `(function(){
     try{
-      function find(){return Array.from(document.querySelectorAll('select')).find(function(s){var o=Array.from(s.options).map(function(x){return x.value;}).join(',');return /25|50|100/.test(o);});}
+      function find(){
+        return Array.from(document.querySelectorAll('select')).find(function(s){
+          return /results per page/.test(Array.from(s.options).map(function(o){return o.text||'';}).join('|'))
+              || /25|50|100/.test(Array.from(s.options).map(function(x){return x.value;}).join(','));
+        });
+      }
       var sel=null, tries=0;
       while(tries<25 && !(sel=find())){ tries++; }
       if(!sel) return JSON.stringify({status:'NO_SELECT'});
-      var opt=document.createElement('option');opt.value=String(${val});opt.text=String(${val});
-      sel.appendChild(opt);sel.value=String(${val});
+      var want=String(${val});
+      var opt=Array.from(sel.options).find(function(o){ return o.value===want; });
+      if(!opt){
+        opt=document.createElement('option');
+        opt.value=want; opt.text=want+' results per page';
+        sel.appendChild(opt);
+      }
+      var d=Object.getOwnPropertyDescriptor(window.HTMLSelectElement.prototype,'value');
+      d.set.call(sel, want);
+      sel.dispatchEvent(new Event('input', {bubbles:true}));
       sel.dispatchEvent(new Event('change',{bubbles:true}));
+      try{ if(window.jQuery) window.jQuery(sel).trigger('change'); }catch(e){}
       return JSON.stringify({status:'OK', setTo: sel.value});
     }catch(e){return JSON.stringify({status:'ERR', msg:String(e)});}
   })();`;
 }
+
+// 读取页面实测状态(行数 / 首行主键 / 每页条数 / 分页文本)。用于「等到真的变了」而不是猜时间。
+async function readPageKey(tid) {
+  const k = await pageExec(tid, path.join(DIR, 'page_key.js'));
+  return (k && k.status === 'OK') ? k : null;
+}
+// 分页器终态复核(只读): next.js 报 NO_NEXT/DISABLED 时不单次采信, 用它做二次确认。
+// 2026-09-28 事故: 第 7 页后 next.js 一次性返回非 OK -> 直接判「无下一页」,
+// 整窗尾部(第 8/9 页, 约 2000 行)被静默吞掉; 实为分页控件重渲染期间短暂不可用。
+async function readPagerState(tid) {
+  const p = await pageExec(tid, path.join(DIR, 'page_end.js'));
+  return (p && p.status === 'OK') ? p : null;
+}
+// 从分页器文本解析「整窗总页数」(独立裁判, 2026-09-28 二次修复)。
+// 例: "Prev 1 2 3 4 5 6 7 8 9 Next" -> 9。
+// 出现 "..." 省略号说明页码被截断 -> 返回 null(未知), 不猜。
+// 页面慢时 分页器/Next 按钮 会在重渲染期间读不到, 此时 hasUsableNext=false 属**假阴性**,
+// 绝不能当成「已到末页」的证据 —— 必须用总页数这个稳定事实来判。
+function parseTotalPages(pagerText) {
+  const t = String(pagerText || '');
+  if (!t || !/Next|Prev/.test(t) || /\.\.\.|…/.test(t)) return null;
+  const nums = (t.match(/\d+/g) || []).map(Number).filter(n => n > 0);
+  return nums.length ? Math.max(...nums) : null;
+}
+
 
 // 日报命名规则(用户 2026-09-02 定):
 //   "<北京时间 M月D日>导出增量数据_<MM-DD> (N 条) + <MM-DD> (M 条).csv"
@@ -234,15 +307,43 @@ function writeState(s) { fs.writeFileSync(STATE, JSON.stringify(s, null, 2), 'ut
   if (!f || f.status !== 'OK') { console.error('设置筛选失败'); process.exit(1); }
   await sleep(rand(9000, 11000));
 
-  // 2) inject 1000
+  // 2) 注入每页条数, 并轮询到「表格实测行数」真的变成目标值(而不是只看 select.value)
   console.log('2) 注入 recordsPerPage =', PAGE_SIZE);
   const injFile = path.join(DIR, '_inject_tmp.js');
   fs.writeFileSync(injFile, makeInjectScript(PAGE_SIZE));
+  const baseKey = await readPageKey(tid);
+  const baseRows = baseKey ? baseKey.rowCount : -1;
   let inj = null;
-  for (let i = 0; i < 6; i++) { inj = await pageExec(tid, injFile); if (inj && inj.status === 'OK') break; await sleep(rand(5000, 7000)); }
-  console.log('   ', JSON.stringify(inj));
-  if (!inj || inj.status !== 'OK') { console.error('注入失败'); process.exit(1); }
-  await sleep(rand(9000, 11000));
+  let rppOk = false;
+  let knownTotalPages = null;   // 整窗总页数(独立裁判): settle 时分页器读到的最大页码
+  for (let attempt = 1; attempt <= 3 && !rppOk; attempt++) {
+    inj = await pageExec(tid, injFile);
+    console.log('   inject#' + attempt + ':', JSON.stringify(inj));
+    if (!inj || inj.status !== 'OK') { await sleep(rand(5000, 7000)); continue; }
+    const t0s = Date.now();
+    while (Date.now() - t0s < SETTLE_RPP_TIMEOUT_MS) {
+      await sleep(POLL_INTERVAL_MS);
+      const k = await readPageKey(tid);
+      if (!k) continue;
+      // 生效判据: 表格行数已不是注入前的基线(说明真重新取数了),
+      // 或已经够到目标页大小(窗口总行数可能少于 PAGE_SIZE)。
+      const target = Math.min(PAGE_SIZE, 900);
+      if (k.rowCount !== baseRows || k.rowCount >= target) {
+        rppOk = true;
+        // 顺手拿下整窗总页数(注入后分页器已按 1000/页 重算): 后续判"是否到末页"用这个, 不靠易假阴性的按钮状态
+        knownTotalPages = parseTotalPages(k.pagerText);
+        console.log('   [settle] 每页条数生效于 ~' + Math.round((Date.now() - t0s) / 1000) + 's: rows=' + k.rowCount + ' (注入前 ' + baseRows + ') pg=' + String(k.pagerText || '').slice(0, 50) + (knownTotalPages ? (' 总页数=' + knownTotalPages) : ' 总页数=未知'));
+        break;
+      }
+    }
+    if (!rppOk) console.log('   [settle] inject#' + attempt + ' 后 ' + (SETTLE_RPP_TIMEOUT_MS / 1000) + 's 内表格未变化, 重试');
+  }
+  if (!rppOk) {
+    // 不因为等不到就假设"已达万行上限"继续跑 —— 那正是本次事故的成因。直接失败留待续跑。
+    console.error('[settle] 每页条数注入未生效, 本轮中止(不落盘, 幂等可续跑)');
+    try { fs.unlinkSync(injFile); } catch (e) {}
+    process.exit(6);
+  }
 
   // 3) paginate + collect (全量翻页扫描 7 天整窗: 不再命中游标即停, 翻到无下一页为止;
   //    游标仅作日志标记; 旧行由去重挡掉, 故整窗重扫零重复)
@@ -268,15 +369,19 @@ function writeState(s) { fs.writeFileSync(STATE, JSON.stringify(s, null, 2), 'ut
   let pages = 0;
   let stuck = false;
   let hitCursor = false;
+  // 抓完一页后「等页面真的翻过去」再抓下一页, 见文件头 SETTLE_* 说明
+  let lastPageRowCount = 0;
   while (pages < MAX_PAGES) {
     let full = null;
     for (let i = 0; i < 4; i++) { full = await pageExec(tid, path.join(DIR, 'extract_full.js')); if (full && full.status === 'OK' && full.rowCount > 0) break; await sleep(rand(4000, 6000)); }
     if (!full || full.status !== 'OK' || full.rowCount === 0) { console.log('   提取为空或失败, 停止翻页'); break; }
     const fullRows = full.rows || [];
     if (!fullRows.length) { console.log('   全量提取为空, 停止'); break; }
-    const firstKey = fullRows[0].join('\u0001');
+    // 主键用「订单号+ASIN」而不是整行文本: 整行含图片等易变字段, 会误判成"变了"
+    const firstKey = (fullRows[0][1] || '') + '|' + (fullRows[0][4] || '');
     if (firstKey === prevFirstKey) { console.log('   首页主键未变化 -> 翻页卡死, 停止'); stuck = true; break; }
     prevFirstKey = firstKey;
+    lastPageRowCount = fullRows.length;
     // 命中游标? 当前页出现上次最新 Order ID => 其下方(含)皆为旧数据
     if (cursor) {
       for (const r of fullRows) { if ((r[1] || '') === cursor) { hitCursor = true; break; } }
@@ -285,10 +390,79 @@ function writeState(s) { fs.writeFileSync(STATE, JSON.stringify(s, null, 2), 'ut
     pages++;
     console.log(`   第 ${pages} 页: +${fullRows.length} 行 (累计 ${collected.length})${hitCursor ? ' [经过上次游标]' : ''}`);
     if (pages >= MAX_PAGES) break;
-    // click next
-    const nx = await pageExec(tid, path.join(DIR, 'next.js'));
-    if (!nx || nx.status !== 'OK') { console.log('   无下一页, 停止'); break; }
-    await sleep(rand(8000, 10000));
+    // 点击下一页, 然后轮询「首行主键真的变了」才继续; 未变则重试点击, 仍不变才判卡死。
+    // 2026-09-28 修复(两轮): ① next.js 报 NO_NEXT/DISABLED 不再单次采信(旧逻辑一次判死,
+    //   实测第 7 页后误停吞掉第 8/9 页约 2000 行); ② **总页数才是独立裁判** —— 页面慢时
+    //   分页器与 Next 按钮会在重渲染期间读不到, 此时 hasUsableNext=false 是假阴性,
+    //   不能当"已到末页"的证据。判据改为: 只要已知总页数且 pages < 总页数, 就必须继续推进;
+    //   只有「已抓到 >= 总页数」或「分页器可读且明确确认到末页」才允许结束。
+    let advanced = false;
+    let noNext = false;
+    let endConfirmed = 0;      // 可读分页器明确确认「已到末页」的连续次数
+    let relaxBudget = 0;       // 无法确认时的额外重试预算(页面慢, 最多放宽 8 次)
+    for (let attempt = 1; attempt <= 10 && !advanced; attempt++) {
+      const behindKnownEnd = !!(knownTotalPages && pages < knownTotalPages);
+      const nx = await pageExec(tid, path.join(DIR, 'next.js'));
+      // ⚠️ 桥级瞬态(CDP_ERROR / 桥不可连, pageExec 内部已重试 3 次) 与「没有下一页」是两码事:
+      //    桥一抖就把确认数记一笔, 等于桥不稳就静默少数据 —— 方向性错误, 必须分开。
+      if (!nx || nx.status === 'CLI_FAIL') {
+        console.log('   [settle] next#' + attempt + ' 桥级瞬态(' + ((nx && nx.status) || 'NULL') + '), 退避重试(不计入末页确认)');
+        if (relaxBudget++ >= 8) break;
+        await sleep(rand(6000, 10000));
+        continue;
+      }
+      if (nx.status === 'OK') {
+        const t0s = Date.now();
+        while (Date.now() - t0s < SETTLE_PAGE_TIMEOUT_MS) {
+          await sleep(POLL_INTERVAL_MS);
+          const k = await readPageKey(tid);
+          if (k && k.firstKey && k.firstKey !== firstKey) {
+            advanced = true;
+            console.log('   [settle] 翻页生效于 ~' + Math.round((Date.now() - t0s) / 1000) + 's: first=' + k.firstKey.slice(0, 26) + ' rows=' + k.rowCount);
+            break;
+          }
+        }
+        if (advanced) break;
+        console.log('   [settle] next#' + attempt + ' 已点击但 ' + (SETTLE_PAGE_TIMEOUT_MS / 1000) + 's 首行未变'
+          + (behindKnownEnd ? ' (分页器表明仍有后续页 ' + pages + '/' + knownTotalPages + ', 判瞬态)' : ''));
+        if (relaxBudget++ >= 8) break;
+        await sleep(rand(6000, 10000));
+        continue;
+      }
+      // NO_NEXT / DISABLED: 需要独立证据才认「整窗扫完」
+      const pg = await readPagerState(tid);
+      if (behindKnownEnd) {
+        console.log('   [settle] next#' + attempt + ' 报 ' + nx.status + ' 但分页器表明仍有后续页(已拉 ' + pages + '/' + knownTotalPages + '), 判瞬态, 退避重试');
+        if (relaxBudget++ >= 8) break;
+        await sleep(rand(8000, 12000));
+        continue;
+      }
+      const atLastPage = pg && pg.totalPages && pg.activePage && pg.activePage >= pg.totalPages;
+      if (atLastPage) {
+        console.log('   已至最后一页(' + pg.activePage + '/' + pg.totalPages + '), 正常结束');
+        noNext = true;
+        break;
+      }
+      if (!pg) {
+        // 分页器读不到 => 状态未知, 不能作为"无下一页"的证据; 已知总页数用尽或未知时放宽重试
+        console.log('   [settle] next#' + attempt + ' 报 ' + nx.status + ' 但分页器探针无结果(未知), 退避重试');
+        if (relaxBudget++ >= 8) break;
+        await sleep(rand(6000, 10000));
+        continue;
+      }
+      endConfirmed++;
+      if (endConfirmed >= 3) { noNext = true; break; }
+      console.log('   [settle] next#' + attempt + ' 报 ' + nx.status + ' 且分页器无可用下一页(确认 ' + endConfirmed + '/3), 稍后复核');
+      if (relaxBudget++ >= 8) break;
+      await sleep(rand(6000, 10000));
+    }
+    if (noNext) { console.log('   无下一页, 停止' + (knownTotalPages ? '(总页数 ' + knownTotalPages + ', 已扫 ' + pages + ')' : '')); break; }
+    if (!advanced) {
+      console.log('   点 Next 后页面始终未推进 -> 判定翻页卡死(stuck), 本轮已抓 ' + pages + ' 页'
+        + (knownTotalPages ? '/共 ' + knownTotalPages + ' 页' : '') + ', 尾部可能未覆盖');
+      stuck = true;
+      break;
+    }
   }
   try { fs.unlinkSync(injFile); } catch (e) {}
 
